@@ -1,14 +1,17 @@
 /**
- * `realmrun` entry point: runs the accumulator fixture or the planet scenario
- * offline against `DATABASE_URL` and prints the committed result. Nothing runs
+ * `realmrun` entry point: runs the accumulator fixture or a planet scenario
+ * offline against `DATABASE_URL` and prints the committed result; for the
+ * evolving planet it can also export its checkpoints as JSON. Nothing runs
  * unless this is the main module.
  */
 
+import { writeFile } from "node:fs/promises";
 import pg from "pg";
 import { parseCliArgs, USAGE, UsageError } from "./cli.ts";
 import type { CliOptions } from "./cli.ts";
+import { buildSnapshotBundle, serializeSnapshotBundle } from "./planet-snapshots.ts";
 import { renderPlanetMap } from "./planetary-map.ts";
-import { runFixture, runPlanet } from "./simulation.ts";
+import { runEvolvingPlanet, runFixture, runPlanet } from "./simulation.ts";
 
 export async function main(args: readonly string[]): Promise<number> {
   let options: CliOptions;
@@ -31,6 +34,14 @@ export async function main(args: readonly string[]): Promise<number> {
   client.on("error", () => {});
   try {
     await client.connect();
+    if (options.planet !== undefined && options.evolve !== undefined) {
+      const result = await runEvolvingPlanet(client, options.until, options.planet);
+      // Only after the run and every checkpoint read succeeded; an existing file is replaced.
+      const path = options.evolve.exportSnapshots;
+      if (path !== undefined) await writeFile(path, serializeSnapshotBundle(buildSnapshotBundle(options.planet, result.snapshots)));
+      console.log(renderPlanetMap(result));
+      return 0;
+    }
     if (options.planet !== undefined) {
       console.log(renderPlanetMap(await runPlanet(client, options.until, options.planet)));
       return 0;

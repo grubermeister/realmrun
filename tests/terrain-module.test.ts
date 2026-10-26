@@ -6,6 +6,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   applyTerrainOperation,
+  CLIMATE_REFRESH_REQUEST,
+  climateRefreshWorkId,
   ELEVATION_MAX,
   ELEVATION_MIN,
   isLand,
@@ -20,8 +22,8 @@ import {
   terrainModule,
 } from "lattice-terrain-module";
 import type { TerrainRecord } from "lattice-terrain-module";
-import { createInMemoryStateStore, createModuleRegistry, executeInMemoryOperation, moduleId } from "realmlib";
-import type { InMemoryStateStore } from "realmlib";
+import { createInMemoryStateStore, createModuleRegistry, executeInMemoryOperation, moduleId, simTime } from "realmlib";
+import type { InMemoryStateStore, OperationHandler, ScheduledWork, WorkEmitter } from "realmlib";
 
 /** The documented sample seeds; both give land and ocean at sea level 0. */
 const SEED = 1729;
@@ -96,11 +98,14 @@ function landRegions(terrain: TerrainRecord): number[] {
 }
 
 describe("lattice-terrain-module consumed independently", () => {
-  test("declares the terrain module with generate at version 1", () => {
+  test("declares the terrain module with generate and raise-sea-level at version 1", () => {
     expect(terrainModule.id).toBe(TERRAIN_MODULE);
     expect(TERRAIN_MODULE).toBe(moduleId("terrain"));
     expect(TERRAIN_KEY).toBe("surface");
-    expect(terrainModule.operations.map((o) => [o.name, o.version])).toEqual([["generate", 1]]);
+    expect(terrainModule.operations.map((o) => [o.name, o.version])).toEqual([
+      ["generate", 1],
+      ["raise-sea-level", 1],
+    ]);
   });
 
   test("the registry accepts valid payloads and rejects invalid ones", () => {
@@ -231,6 +236,146 @@ describe("lattice-terrain-module consumed independently", () => {
     const input = { moduleId: other, operation: "generate", payloadVersion: 1, payload: { seed: 1, seaLevel: 0 } };
     expect(() => executeInMemoryOperation(registry, store, input, applyTerrainOperation)).toThrow("terrain handler received");
     expect(store.forModule(other).get(other, TERRAIN_KEY)).toBeUndefined();
+  });
+
+  describe("raise-sea-level", () => {
+    const raise = (payload: unknown, payloadVersion = 1) => request(payload, "raise-sea-level", payloadVersion);
+
+    /** An emitter like the one a realmlib operation runtime supplies, recording what is emitted. */
+    function recordingEmitter(now = 1_000) {
+      const emitted: ScheduledWork[] = [];
+      const emitter: WorkEmitter = { now: simTime(now), emit: (work) => void emitted.push(work) };
+      return { emitter, emitted };
+    }
+
+    /** The terrain handler, given `emitter` as realmlib's operation runtimes would. */
+    const withEmitter = (emitter: WorkEmitter): OperationHandler => (req, state, random) =>
+      applyTerrainOperation(req, state, random, emitter);
+
+    /** A fresh store with a generated surface at `seaLevel`. */
+    function generated(seaLevel = 0) {
+      const { registry, store } = setup();
+      expect(executeInMemoryOperation(registry, store, request({ seed: SEED, seaLevel }), applyTerrainOperation).ok).toBe(true);
+      return { registry, store };
+    }
+
+    test("the registry accepts exactly { toSeaLevel } with an integer in range", () => {
+      const { registry } = setup();
+      for (const toSeaLevel of [-100, 0, 10, 100]) expect(registry.validate(raise({ toSeaLevel })).ok).toBe(true);
+      for (const payload of [
+        undefined,
+        null,
+        10,
+        [10],
+        {},
+        { seaLevel: 10 },
+        { toSeaLevel: 10, extra: 1 },
+        { toSeaLevel: -0 },
+        { toSeaLevel: 1.5 },
+        { toSeaLevel: "10" },
+        { toSeaLevel: Number.NaN },
+        { toSeaLevel: 101 },
+        { toSeaLevel: -101 },
+      ]) {
+        expect(registry.validate(raise(payload))).toEqual({ ok: false, reason: "invalid-payload" });
+      }
+      expect(registry.validate(raise({ toSeaLevel: 10 }, 2))).toEqual({ ok: false, reason: "unsupported-version" });
+    });
+
+    test("replaces only the sea level of terrain's own record and emits one climate refresh at the same time", () => {
+      const { registry, store } = generated();
+      const before = parseTerrainRecord(committed(store));
+      const { emitter, emitted } = recordingEmitter();
+      const calls: string[] = [];
+      const observed: OperationHandler = (req, state, random) =>
+        withEmitter(emitter)(
+          req,
+          {
+            get: (owner, key) => (calls.push(`get ${owner}/${key}`), state.get(owner, key)),
+            set: (key, value) => (calls.push(`set ${key}`), state.set(key, value)),
+            delete: (key) => (calls.push(`delete ${key}`), state.delete(key)),
+          },
+          random,
+        );
+      expect(executeInMemoryOperation(registry, store, raise({ toSeaLevel: 10 }), observed).ok).toBe(true);
+      expect(calls).toEqual(["get terrain/surface", "set surface"]);
+
+      const after = parseTerrainRecord(committed(store));
+      expect(after).toEqual({ ...before, seaLevel: 10 });
+      expect(Object.keys(after)).toEqual(Object.keys(before));
+      expect(landCount(after)).toBeLessThan(landCount(before));
+
+      expect(emitted).toEqual([
+        {
+          id: climateRefreshWorkId(1_000, 10),
+          at: simTime(1_000),
+          request: { moduleId: moduleId("climate"), operation: "refresh", payloadVersion: 1, payload: {} },
+        },
+      ]);
+      expect(emitted[0]!.id).toBe("terrain-climate-refresh-1000-10" as never);
+      expect(emitted[0]!.request).toEqual(CLIMATE_REFRESH_REQUEST);
+    });
+
+    test("the emitted work ID depends only on the simulated time and target level", () => {
+      expect(climateRefreshWorkId(1_000, 10)).toBe(climateRefreshWorkId(1_000, 10));
+      expect(climateRefreshWorkId(1_000, 10)).not.toBe(climateRefreshWorkId(2_000, 10));
+      expect(climateRefreshWorkId(1_000, 10)).not.toBe(climateRefreshWorkId(1_000, 11));
+    });
+
+    test("fails without changes or emission if no surface has been generated", () => {
+      const { registry, store } = setup();
+      const { emitter, emitted } = recordingEmitter();
+      expect(() => executeInMemoryOperation(registry, store, raise({ toSeaLevel: 10 }), withEmitter(emitter))).toThrow(
+        "terrain surface has not been generated",
+      );
+      expect(committed(store)).toBeUndefined();
+      expect(emitted).toEqual([]);
+    });
+
+    test("fails without changes or emission if the committed surface is invalid", () => {
+      const { registry, store } = generated();
+      const corrupt = { ...parseTerrainRecord(committed(store)), schemaVersion: 2 };
+      store.forModule(TERRAIN_MODULE).set(TERRAIN_KEY, corrupt);
+      const { emitter, emitted } = recordingEmitter();
+      expect(() => executeInMemoryOperation(registry, store, raise({ toSeaLevel: 10 }), withEmitter(emitter))).toThrow(
+        "Invalid terrain record",
+      );
+      expect(committed(store)).toEqual(corrupt);
+      expect(emitted).toEqual([]);
+    });
+
+    test.each([0, -5])("refuses to move the sea level from 0 to %d: it can only rise", (toSeaLevel) => {
+      const { registry, store } = generated();
+      const before = committed(store);
+      const { emitter, emitted } = recordingEmitter();
+      expect(() => executeInMemoryOperation(registry, store, raise({ toSeaLevel }), withEmitter(emitter))).toThrow(
+        "sea level can only rise",
+      );
+      expect(committed(store)).toEqual(before!);
+      expect(emitted).toEqual([]);
+    });
+
+    test("refuses to run without a work emitter, as through the plain execution helper", () => {
+      const { registry, store } = generated();
+      const before = committed(store);
+      expect(() => executeInMemoryOperation(registry, store, raise({ toSeaLevel: 10 }), applyTerrainOperation)).toThrow(
+        "needs a work emitter",
+      );
+      expect(committed(store)).toEqual(before!);
+    });
+
+    test("a misrouted request throws and commits nothing", () => {
+      const registry = createModuleRegistry();
+      const other = moduleId("other");
+      registry.register({ id: other, operations: [{ name: "raise-sea-level", version: 1, validatePayload: () => true }] });
+      const { store } = generated();
+      const { emitter, emitted } = recordingEmitter();
+      const input = { moduleId: other, operation: "raise-sea-level", payloadVersion: 1, payload: { toSeaLevel: 10 } };
+      expect(() => executeInMemoryOperation(registry, store, input, withEmitter(emitter))).toThrow("terrain handler received");
+      expect(store.forModule(other).get(other, TERRAIN_KEY)).toBeUndefined();
+      expect(parseTerrainRecord(committed(store)).seaLevel).toBe(0);
+      expect(emitted).toEqual([]);
+    });
   });
 
   describe("parseTerrainRecord", () => {

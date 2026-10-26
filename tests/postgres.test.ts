@@ -1,12 +1,25 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CLIMATE_REFRESH_REQUEST, climateRefreshWorkId } from "lattice-terrain-module";
 import pg from "pg";
-import { simTime } from "realmlib";
-import { DEFAULT_PLANET_CONFIG, readPlanetRecords, TERRAIN_MODULE } from "../src/planetary-fixture.ts";
+import { initializePostgresSchedulerStorage, loadPostgresOperationRuntime, simTime, WorkIdConflictError } from "realmlib";
+import type { ScheduledWork } from "realmlib";
+import { buildSnapshotBundle, serializeSnapshotBundle } from "../src/planet-snapshots.ts";
+import {
+  applyPlanetOperation,
+  createPlanetRegistry,
+  DEFAULT_PLANET_CONFIG,
+  evolvingPlanetWork,
+  planetSnapshotTimes,
+  readPlanetRecords,
+  TERRAIN_MODULE,
+} from "../src/planetary-fixture.ts";
 import type { PlanetConfig } from "../src/planetary-fixture.ts";
 import { renderPlanetMap } from "../src/planetary-map.ts";
-import { DatabaseNotReadyError, runFixture, runPlanet } from "../src/simulation.ts";
-import { runFixtureInMemory, runPlanetInMemory } from "./in-memory-reference.ts";
+import { advanceWithCheckpoints, DatabaseNotReadyError, runEvolvingPlanet, runFixture, runPlanet } from "../src/simulation.ts";
+import { runEvolvingPlanetInMemory, runFixtureInMemory, runPlanetInMemory } from "./in-memory-reference.ts";
 
 // Opt-in: runs only against a separate, disposable database named by this variable.
 const databaseUrl = process.env.REALMRUN_TEST_DATABASE_URL;
@@ -199,6 +212,183 @@ function definePostgresTests(url: string): void {
       const reseeded = await run("--seed", "42", "--until", "0");
       expect(reseeded).not.toBe(first);
       expect(reseeded).toStartWith("Planet: seed 42, sea level 0, mean temperature 15 C\n");
+    });
+  });
+
+  describe("evolving planet through the PostgreSQL operation runtime", () => {
+    const committedRows = async () =>
+      (
+        await observer.query(
+          "SELECT module_id, record_key, value::text AS value FROM realmlib.state_records ORDER BY module_id, record_key",
+        )
+      ).rows.map((r) => ({ module: r.module_id, key: r.record_key, value: JSON.parse(r.value) }));
+
+    const workRows = async () =>
+      (
+        await observer.query(
+          `SELECT work_id, at_ms::int AS at, sequence::int AS sequence, module_id, operation, payload_version::int AS version,
+                  payload::text AS payload, status, completed_at_ms::int AS completed_at
+           FROM realmlib.work_items ORDER BY sequence`,
+        )
+      ).rows.map((r) => ({ ...r, payload: JSON.parse(r.payload) }));
+
+    const advisoryLocks = async () =>
+      (
+        await observer.query(`SELECT count(*)::int AS n FROM pg_locks
+           WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`)
+      ).rows[0].n;
+
+    const generateRow = { work_id: "planet-terrain-generate", at: 0, sequence: 0, module_id: "terrain", operation: "generate" };
+    const deriveRow = { work_id: "planet-climate-derive", at: 0, sequence: 1, module_id: "climate", operation: "derive" };
+    const raiseRow = { work_id: "planet-terrain-raise-sea-level", at: 1_000, sequence: 2, module_id: "terrain", operation: "raise-sea-level" };
+
+    test.each([
+      [DEFAULT_PLANET_CONFIG, 0],
+      [DEFAULT_PLANET_CONFIG, 999],
+      [DEFAULT_PLANET_CONFIG, 1_000],
+      [DEFAULT_PLANET_CONFIG, 2_000],
+      [{ seed: 42, seaLevel: 5, meanTempC: 3 } satisfies PlanetConfig, 2_000],
+    ])("%j to %d ms matches the in-memory operation runtime at every checkpoint", async (config, until) => {
+      const result = await runEvolvingPlanet(driver, simTime(until), config);
+      const reference = await runEvolvingPlanetInMemory(config, simTime(until));
+      expect(result.snapshots.map((s) => s.atMs)).toEqual(planetSnapshotTimes(simTime(until)) as never);
+      expect(result.snapshots).toEqual(reference.snapshots);
+      const final = reference.snapshots.at(-1)!;
+      expect(result).toMatchObject({ now: simTime(until), terrain: final.terrain, climate: final.climate });
+      expect(serializeSnapshotBundle(buildSnapshotBundle(config, result.snapshots))).toBe(
+        serializeSnapshotBundle(buildSnapshotBundle(config, reference.snapshots)),
+      );
+
+      // What committed, seen from another connection.
+      expect(await committedRows()).toEqual([
+        { module: "climate", key: "climate", value: final.climate },
+        { module: "terrain", key: "surface", value: final.terrain },
+      ]);
+      const state = await observer.query("SELECT now_ms::text AS now FROM realmlib.runtime_state");
+      expect(state.rows).toEqual([{ now: String(until) }]);
+      const rows = await workRows();
+      if (until < 1_000) {
+        expect(rows.map(({ work_id, status }) => [work_id, status])).toEqual([
+          ["planet-terrain-generate", "completed"],
+          ["planet-climate-derive", "completed"],
+          ["planet-terrain-raise-sea-level", "pending"],
+        ]);
+      } else {
+        // The emitted refresh was durably inserted with the rise and then completed at the same time.
+        const toSeaLevel = config.seaLevel + 10;
+        expect(rows).toEqual([
+          { ...generateRow, version: 1, payload: { seed: config.seed, seaLevel: config.seaLevel }, status: "completed", completed_at: 0 },
+          { ...deriveRow, version: 1, payload: { meanTempC: config.meanTempC }, status: "completed", completed_at: 0 },
+          { ...raiseRow, version: 1, payload: { toSeaLevel }, status: "completed", completed_at: 1_000 },
+          {
+            work_id: climateRefreshWorkId(1_000, toSeaLevel),
+            at: 1_000,
+            sequence: 3,
+            module_id: "climate",
+            operation: "refresh",
+            version: 1,
+            payload: {},
+            status: "completed",
+            completed_at: 1_000,
+          },
+        ]);
+        expect(rows.map((r) => ({ id: r.work_id, at: r.at }))).toEqual(reference.executed);
+      }
+      expect(await advisoryLocks()).toBe(0);
+    });
+
+    test("a conflicting emitted work ID rolls back the rise and its emission in PostgreSQL too", async () => {
+      await initializePostgresSchedulerStorage(driver, simTime(0));
+      const runtime = await loadPostgresOperationRuntime(driver);
+      const squatter: ScheduledWork = { id: climateRefreshWorkId(1_000, 10), at: simTime(5_000), request: CLIMATE_REFRESH_REQUEST };
+      for (const work of [...evolvingPlanetWork(DEFAULT_PLANET_CONFIG), squatter]) {
+        expect(await runtime.scheduler.schedule(work)).toBe("accepted");
+      }
+      expect(await runtime.tryAcquireOwnership()).toBe(true);
+      const scenario = { registry: createPlanetRegistry(), handler: applyPlanetOperation, read: readPlanetRecords };
+      await expect(advanceWithCheckpoints(runtime, simTime(1_000), scenario)).rejects.toThrow(WorkIdConflictError);
+      await runtime.releaseOwnership();
+
+      const reference = await runEvolvingPlanetInMemory(DEFAULT_PLANET_CONFIG, simTime(0));
+      expect(await committedRows()).toEqual([
+        { module: "climate", key: "climate", value: reference.snapshots[0]!.climate },
+        { module: "terrain", key: "surface", value: reference.snapshots[0]!.terrain },
+      ]);
+      expect((await workRows()).map(({ work_id, at, status, completed_at }) => [work_id, at, status, completed_at])).toEqual([
+        ["planet-terrain-generate", 0, "completed", 0],
+        ["planet-climate-derive", 0, "completed", 0],
+        ["planet-terrain-raise-sea-level", 1_000, "pending", null],
+        [squatter.id, 5_000, "pending", null],
+      ]);
+      // The established exception: the failed item leaves the clock at its time.
+      const state = await observer.query("SELECT now_ms::text AS now FROM realmlib.runtime_state");
+      expect(state.rows).toEqual([{ now: "1000" }]);
+      expect(await advisoryLocks()).toBe(0);
+    });
+
+    test("an already populated database is refused and left unchanged", async () => {
+      await runPlanet(driver, simTime(0), DEFAULT_PLANET_CONFIG);
+      const before = await committedRows();
+      await expect(runEvolvingPlanet(driver, simTime(2_000), DEFAULT_PLANET_CONFIG)).rejects.toThrow(DatabaseNotReadyError);
+      expect(await committedRows()).toEqual(before);
+      expect(await advisoryLocks()).toBe(0);
+    });
+
+    test("the CLI prints the final map and exports byte-identical JSON on a fresh rerun, and none on a failed run", async () => {
+      await driver.end();
+      const dir = await mkdtemp(join(tmpdir(), "realmrun-export-"));
+      const run = async (...args: string[]) => {
+        const child = Bun.spawn(["bun", mainPath, "--scenario", "planet-evolve", ...args], {
+          cwd: dir,
+          env: { ...process.env, DATABASE_URL: url },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [code, stdout, stderr] = await Promise.all([child.exited, child.stdout.text(), child.stderr.text()]);
+        return { code, stdout, stderr };
+      };
+      const fresh = async () => {
+        await observer.query("DROP SCHEMA realmlib CASCADE");
+        migrated = false;
+        await migrate();
+      };
+      const args = ["--seed", "1729", "--sea-level", "0", "--mean-temp", "15", "--until", "2000"];
+      try {
+        // An existing file is replaced.
+        await writeFile(join(dir, "first.json"), "stale");
+        const first = await run(...args, "--export-snapshots", "./first.json");
+        expect({ code: first.code, stderr: first.stderr }).toEqual({ code: 0, stderr: "" });
+        const reference = await runEvolvingPlanetInMemory(DEFAULT_PLANET_CONFIG, simTime(2_000));
+        const final = reference.snapshots.at(-1)!;
+        expect(first.stdout).toBe(`${renderPlanetMap({ ...final, now: reference.now })}\n`);
+        expect(first.stdout).toStartWith("Planet: seed 1729, sea level 10, mean temperature 15 C\n");
+        expect(first.stdout).toContain("Simulated time: 2000 ms\n");
+        expect(first.stdout).toContain("Surface: ocean 644 cells");
+        const exported = await Bun.file(join(dir, "first.json")).text();
+        expect(exported).toBe(serializeSnapshotBundle(buildSnapshotBundle(DEFAULT_PLANET_CONFIG, reference.snapshots)));
+        const bundle = JSON.parse(exported);
+        expect(bundle.snapshots.map((s: { atMs: number }) => s.atMs)).toEqual([0, 1_000, 2_000]);
+        expect(bundle.events).toHaveLength(1);
+
+        await fresh();
+        const second = await run(...args, "--export-snapshots=second.json");
+        expect(second.code).toBe(0);
+        expect(second.stdout).toBe(first.stdout);
+        expect(await Bun.file(join(dir, "second.json")).text()).toBe(exported);
+
+        // Without the flag, nothing is written.
+        await fresh();
+        expect((await run(...args)).stdout).toBe(first.stdout);
+
+        // The database is now populated, so the run fails and writes nothing.
+        const refused = await run(...args, "--export-snapshots", "refused.json");
+        expect(refused.code).toBe(1);
+        expect(refused.stdout).toBe("");
+        expect(refused.stderr).toContain("already holds a simulation");
+        expect((await readdir(dir)).sort()).toEqual(["first.json", "second.json"]);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
     });
   });
 

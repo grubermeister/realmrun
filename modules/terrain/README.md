@@ -5,27 +5,69 @@ seeded elevation field for a whole planet's surface. It is a private local
 package inside realmrun for now, written so it can move to its own repository
 without changing what it exports.
 
-This is a deliberately simplified experiment: a static, low-resolution height
-field with contiguous land and ocean, not a geological model. There is no
-tectonics, erosion, or evolution over time.
+This is a deliberately simplified experiment: a low-resolution height field
+with contiguous land and ocean, not a geological model. There is no tectonics
+or erosion; the only change after generation is a rise in sea level.
 
 ## State and operations
 
-The module `terrain` owns one record, `surface`, written only by its one
-operation:
+The module `terrain` owns one record, `surface`, written only by its two
+operations:
 
-| Operation  | Payload (version 1)                   | Effect                                         |
-|------------|---------------------------------------|------------------------------------------------|
-| `generate` | `{ seed: number, seaLevel: number }`  | `surface` becomes the surface for that input   |
+| Operation         | Payload (version 1)                   | Effect                                         |
+|-------------------|---------------------------------------|------------------------------------------------|
+| `generate`        | `{ seed: number, seaLevel: number }`  | `surface` becomes the surface for that input   |
+| `raise-sea-level` | `{ toSeaLevel: number }`              | `surface` gets the higher sea level; emits climate's `refresh` |
 
 - `seed`: an unsigned 32-bit integer, `0` to `4294967295`.
-- `seaLevel`: an integer from `-100` to `100`.
+- `seaLevel`, `toSeaLevel`: integers from `-100` to `100`.
 
 Any other payload, including extra fields, fractions, and `-0`, is rejected by
 the registry as `invalid-payload`. `generate` replaces an existing `surface`
 record; a host that wants a planet generated only once must schedule it once.
 The handler throws, committing nothing, if it is given a request addressed to
 any other module.
+
+### `raise-sea-level`
+
+Reads the committed `surface` record through the state view and writes it
+back with `seaLevel` set to `toSeaLevel`, keeping the seed, dimensions, and
+elevations exactly. As part of the same operation it **emits** one work item
+through the `WorkEmitter` realmlib passes its handler:
+
+```ts
+{
+  id: climateRefreshWorkId(emitter.now, toSeaLevel), // "terrain-climate-refresh-<now>-<toSeaLevel>"
+  at: emitter.now,                                   // due at the same simulated time
+  request: CLIMATE_REFRESH_REQUEST,                  // climate, "refresh", payload version 1, {}
+}
+```
+
+realmlib commits the new surface and stores the emitted item together, or
+neither. The ID depends only on the simulated time and the target level,
+never on the wall clock or randomness. Terrain does not schedule work itself,
+does not run or import climate, and never writes climate's state.
+
+It throws, committing and emitting nothing, if:
+
+- no `surface` record is committed (`terrain surface has not been generated`),
+  or it fails `parseTerrainRecord`;
+- `toSeaLevel` is not strictly above the committed sea level (`sea level can
+  only rise`);
+- no work emitter is supplied: it must run for a scheduled work item of a
+  realmlib operation runtime (`createInMemoryOperationRuntime()` or
+  `loadPostgresOperationRuntime()`), not through `executeInMemoryOperation()`;
+- realmlib cannot store the emitted item, for example because different work
+  already holds its ID. realmlib then fails the whole operation, which stays
+  pending.
+
+**Coupling to climate.** `CLIMATE_REFRESH_REQUEST` spells out the public
+address of climate's `refresh` operation: `moduleId("climate")`, operation
+`"refresh"`, payload version 1, payload `{}`. It is the only thing terrain
+knows about climate. Terrain cannot import it from
+[`lattice-climate-module`](../climate/README.md), which already depends on
+this package for the record contract, so the address is a protocol-level
+constant that both packages must keep in step.
 
 ### The `surface` record (schema version 1)
 
@@ -73,13 +115,16 @@ Import everything from the package root, `lattice-terrain-module`:
 
 | Export                      | Type                          | What it is                                       |
 |-----------------------------|-------------------------------|--------------------------------------------------|
-| `terrainModule`             | `ModuleDefinition` (realmlib) | The module ID and its `generate` operation       |
-| `applyTerrainOperation`     | `OperationHandler` (realmlib) | The handler for its operation                    |
+| `terrainModule`             | `ModuleDefinition` (realmlib) | The module ID and its two operations             |
+| `applyTerrainOperation`     | `OperationHandler` (realmlib) | The handler for its operations                   |
 | `TERRAIN_MODULE`            | `ModuleId` (realmlib)         | `"terrain"`, the owning module                   |
 | `TERRAIN_KEY`               | `string`                      | `"surface"`, the key of its record               |
 | `TERRAIN_SCHEMA_VERSION`    | `1`                           | The record's schema version                      |
 | `TerrainRecord`             | type                          | The record's shape                               |
 | `TerrainGenerateParams`     | type                          | The `generate` payload's shape                   |
+| `TerrainRaiseSeaLevelParams` | type                         | The `raise-sea-level` payload's shape            |
+| `CLIMATE_REFRESH_REQUEST`   | `OperationRequest` (realmlib) | The climate `refresh` request it emits           |
+| `climateRefreshWorkId(now, toSeaLevel)` | function          | The ID it emits that request under               |
 | `parseTerrainRecord(value)` | function                      | Checks a value against the record contract and returns it typed; throws `TypeError` naming the problem |
 | `isLand(record, index)`     | function                      | Whether a cell is above sea level                |
 | `rowLatitude(row)`          | function                      | The latitude of a row's centre, in degrees       |
@@ -110,9 +155,11 @@ executeInMemoryOperation(registry, store, request, applyTerrainOperation);
 parseTerrainRecord(store.forModule(TERRAIN_MODULE).get(TERRAIN_MODULE, TERRAIN_KEY)).elevation.length; // 1152
 ```
 
-With realmlib's PostgreSQL runtime, pass the same handler to
-`runtime.execute(registry, request, applyTerrainOperation)` from the
-scheduler's `advanceTo()` callback.
+With realmlib's operation runtimes (PostgreSQL or in-memory), pass the same
+handler to `runtime.execute(registry, request, applyTerrainOperation)` from
+the scheduler's `advanceTo()` callback. `raise-sea-level` works only there,
+since only they supply the work emitter, and its emitted `refresh` needs the
+climate module registered and dispatched too.
 
 Importing the package is inert: it does not register itself, touch any state or
 database, schedule work, read the environment, or start anything. It depends

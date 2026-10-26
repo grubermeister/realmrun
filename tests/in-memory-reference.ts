@@ -2,17 +2,24 @@
  * The scenarios run through realmlib's in-memory core path (in-memory
  * scheduler, state store, and executeInMemoryOperation), the references the
  * PostgreSQL runs must agree with. Both start from empty state with the same work.
+ *
+ * The evolving planet needs the work emitter, which that plain path does not
+ * supply, so its reference runs through realmlib's in-memory operation runtime.
  */
 
-import { createInMemoryScheduler, createInMemoryStateStore, executeInMemoryOperation } from "realmlib";
-import type { SimTime, StateValue } from "realmlib";
+import { createInMemoryOperationRuntime, createInMemoryScheduler, createInMemoryStateStore, executeInMemoryOperation } from "realmlib";
+import type { InMemoryOperationRuntime, SimTime, StateValue } from "realmlib";
+import type { PlanetSnapshot } from "../src/planet-snapshots.ts";
 import { ACCUMULATOR_KEY, ACCUMULATOR_MODULE, applyFixtureOperation, createFixtureRegistry, FIXTURE_WORK } from "../src/fixture.ts";
 import {
   applyPlanetOperation,
   CLIMATE_KEY,
   CLIMATE_MODULE,
   createPlanetRegistry,
+  evolvingPlanetWork,
+  planetSnapshotTimes,
   planetWork,
+  readPlanetRecords,
   TERRAIN_KEY,
   TERRAIN_MODULE,
 } from "../src/planetary-fixture.ts";
@@ -61,4 +68,36 @@ export async function runPlanetInMemory(
     climate: store.forModule(CLIMATE_MODULE).get(CLIMATE_MODULE, CLIMATE_KEY),
     executed,
   };
+}
+
+/**
+ * The evolving planet's work for `config`, scheduled in its usual order on a
+ * new in-memory operation runtime and run to `until`, reading the committed
+ * records at each of `planetSnapshotTimes(until)`. Returns the runtime too, for
+ * inspecting its storage, and every executed item in execution order.
+ */
+export async function runEvolvingPlanetInMemory(
+  config: PlanetConfig,
+  until: SimTime,
+): Promise<{
+  runtime: InMemoryOperationRuntime;
+  now: SimTime;
+  snapshots: PlanetSnapshot[];
+  executed: { id: string; at: number }[];
+}> {
+  const registry = createPlanetRegistry();
+  const runtime = createInMemoryOperationRuntime();
+  for (const work of evolvingPlanetWork(config)) await runtime.scheduler.schedule(work);
+  const executed: { id: string; at: number }[] = [];
+  const snapshots: PlanetSnapshot[] = [];
+  for (const target of planetSnapshotTimes(until)) {
+    const result = await runtime.scheduler.advanceTo(target, 100, (work) => {
+      const outcome = runtime.execute(registry, work.request, applyPlanetOperation);
+      if (!outcome.ok) throw new Error(`work ${work.id} rejected: ${outcome.reason}`);
+      executed.push({ id: work.id, at: work.at });
+    });
+    if (!result.reachedTarget) throw new Error("in-memory reference did not reach its target");
+    snapshots.push({ atMs: target, ...readPlanetRecords((owner, key) => runtime.read(owner, key)) });
+  }
+  return { runtime, now: await runtime.scheduler.now(), snapshots, executed };
 }

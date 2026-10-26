@@ -17,6 +17,7 @@ import {
 import type { ClimateRecord } from "lattice-climate-module";
 import {
   applyTerrainOperation,
+  CLIMATE_REFRESH_REQUEST,
   isLand,
   rowLatitude,
   SURFACE_CELLS,
@@ -82,11 +83,19 @@ function expectPlainState(value: StateValue): void {
 }
 
 describe("lattice-climate-module consumed independently", () => {
-  test("declares the climate module with derive at version 1", () => {
+  test("declares the climate module with derive and refresh at version 1", () => {
     expect(climateModule.id).toBe(CLIMATE_MODULE);
     expect(CLIMATE_MODULE).toBe(moduleId("climate"));
     expect(CLIMATE_KEY).toBe("climate");
-    expect(climateModule.operations.map((o) => [o.name, o.version])).toEqual([["derive", 1]]);
+    expect(climateModule.operations.map((o) => [o.name, o.version])).toEqual([
+      ["derive", 1],
+      ["refresh", 1],
+    ]);
+  });
+
+  test("refresh is at the address terrain's raise-sea-level emits", () => {
+    const { registry } = setup();
+    expect(registry.validate(CLIMATE_REFRESH_REQUEST)).toEqual({ ok: true, request: CLIMATE_REFRESH_REQUEST });
   });
 
   test("the registry accepts valid payloads and rejects invalid ones", () => {
@@ -216,6 +225,95 @@ describe("lattice-climate-module consumed independently", () => {
     const input = { moduleId: other, operation: "derive", payloadVersion: 1, payload: { meanTempC: 15 } };
     expect(() => executeInMemoryOperation(registry, store, input, applyClimateOperation)).toThrow("climate handler received");
     expect(read(store, other, CLIMATE_KEY)).toBeUndefined();
+  });
+
+  describe("refresh", () => {
+    const refresh = (payload: unknown, payloadVersion = 1) => ({
+      moduleId: CLIMATE_MODULE,
+      operation: "refresh",
+      payloadVersion,
+      payload,
+    });
+
+    /** Replaces the committed terrain with the same surface at `seaLevel`, as terrain's raise-sea-level would. */
+    function flood(store: InMemoryStateStore, seaLevel: number): TerrainRecord {
+      const raised = { ...terrainOf(store)!, seaLevel };
+      store.forModule(TERRAIN_MODULE).set(TERRAIN_KEY, raised);
+      return raised;
+    }
+
+    test("the registry accepts exactly {}", () => {
+      const { registry } = setup();
+      expect(registry.validate(refresh({})).ok).toBe(true);
+      for (const payload of [undefined, null, 0, [], { meanTempC: 15 }, { force: true }]) {
+        expect(registry.validate(refresh(payload))).toEqual({ ok: false, reason: "invalid-payload" });
+      }
+      expect(registry.validate(refresh({}, 2))).toEqual({ ok: false, reason: "unsupported-version" });
+    });
+
+    test("re-derives from the new committed terrain, keeping the prior baseline, and writes only its own record", () => {
+      const { registry, store } = planet(-3);
+      const before = climateOf(store)!;
+      const terrain = flood(store, 10);
+      const calls: string[] = [];
+      const observed: OperationHandler = (request, state) =>
+        applyClimateOperation(request, {
+          get: (owner, key) => (calls.push(`get ${owner}/${key}`), state.get(owner, key)),
+          set: (key, value) => (calls.push(`set ${key}`), state.set(key, value)),
+          delete: (key) => (calls.push(`delete ${key}`), state.delete(key)),
+        });
+      expect(executeInMemoryOperation(registry, store, refresh({}), observed).ok).toBe(true);
+      expect(calls).toEqual(["get climate/climate", "get terrain/surface", "set climate"]);
+      expect(terrainOf(store)).toEqual(terrain);
+
+      const after = climateOf(store)!;
+      expect(after.meanTempC).toBe(-3);
+      expect(after.biome).not.toEqual(before.biome);
+      after.biome.forEach((biome, index) => expect(biome === "ocean").toBe(!isLand(terrain, index)));
+      // The same result as deriving afresh with that baseline from the flooded terrain.
+      expect(after).toEqual(climateOf(planet(-3, SEED, 10).store)!);
+    });
+
+    test("fails without changes if climate has not been derived", () => {
+      const { registry, store } = planet();
+      expect(() => executeInMemoryOperation(registry, store, refresh({}), applyClimateOperation)).toThrow(
+        "climate has not been derived",
+      );
+      expect(climateOf(store)).toBeUndefined();
+    });
+
+    test("fails without changes if terrain has not been generated", () => {
+      const { registry, store } = setup();
+      const climate = climateOf(planet(15).store)!;
+      store.forModule(CLIMATE_MODULE).set(CLIMATE_KEY, climate);
+      expect(() => executeInMemoryOperation(registry, store, refresh({}), applyClimateOperation)).toThrow(
+        "terrain surface has not been generated",
+      );
+      expect(climateOf(store)).toEqual(climate);
+    });
+
+    test.each([
+      ["climate", "a newer schema version", (c: ClimateRecord) => ({ ...c, schemaVersion: 2 }), "Invalid climate record"],
+      ["climate", "an out-of-range baseline", (c: ClimateRecord) => ({ ...c, meanTempC: 99 }), "Invalid climate record"],
+      ["terrain", "a newer schema version", (t: TerrainRecord) => ({ ...t, schemaVersion: 2 }), "Invalid terrain record"],
+    ] as const)("an invalid %s record (%s) fails without changes", (which, _, corrupt, message) => {
+      const { registry, store } = planet(15);
+      if (which === "climate") store.forModule(CLIMATE_MODULE).set(CLIMATE_KEY, corrupt(climateOf(store)! as never) as StateValue);
+      else store.forModule(TERRAIN_MODULE).set(TERRAIN_KEY, corrupt(terrainOf(store)! as never) as StateValue);
+      const climateBefore = climateOf(store);
+      expect(() => executeInMemoryOperation(registry, store, refresh({}), applyClimateOperation)).toThrow(message);
+      expect(climateOf(store)).toEqual(climateBefore!);
+    });
+
+    test("a misrouted request throws and commits nothing", () => {
+      const { store } = planet(15);
+      const registry = createModuleRegistry();
+      const other = moduleId("other");
+      registry.register({ id: other, operations: [{ name: "refresh", version: 1, validatePayload: () => true }] });
+      const input = { moduleId: other, operation: "refresh", payloadVersion: 1, payload: {} };
+      expect(() => executeInMemoryOperation(registry, store, input, applyClimateOperation)).toThrow("climate handler received");
+      expect(read(store, other, CLIMATE_KEY)).toBeUndefined();
+    });
   });
 
   describe("parseClimateRecord", () => {

@@ -1,22 +1,23 @@
 /**
  * The terrain simulation module: one coarse, seeded elevation field for a
  * whole planet's surface, owned by the `terrain` module as its `surface`
- * record and written only by its `generate` operation.
+ * record and written only by its `generate` and `raise-sea-level` operations.
  *
  * The surface is a fixed 48 × 24 longitude/latitude raster: rows run from
  * north to south and columns wrap around at the dateline. It is a visual
  * approximation, not an equal-area grid. Elevations are a few octaves of
  * longitude-wrapped value noise, so land and ocean form contiguous regions.
  *
- * This package declares the module, handles its operation, and publishes the
+ * This package declares the module, handles its operations, and publishes the
  * read-only contract of its record ({@link parseTerrainRecord}, {@link isLand},
  * {@link rowLatitude}) for other modules that read it. It does not register
- * itself, schedule work, or choose when operations run. Importing it has no
- * side effects.
+ * itself, schedule work, or choose when operations run; `raise-sea-level` only
+ * emits its one consequence, a climate `refresh`, through the emitter realmlib
+ * passes it. Importing it has no side effects.
  */
 
-import { moduleId } from "realmlib";
-import type { ModuleDefinition, OperationHandler } from "realmlib";
+import { moduleId, workItemId } from "realmlib";
+import type { ModuleDefinition, OperationHandler, OperationRequest, WorkItemId } from "realmlib";
 
 /** The module's ID, under which it owns its state. */
 export const TERRAIN_MODULE = moduleId("terrain");
@@ -69,6 +70,38 @@ export interface TerrainGenerateParams {
   readonly seaLevel: number;
 }
 
+/** The payload of `raise-sea-level`, at payload version 1. */
+export interface TerrainRaiseSeaLevelParams {
+  /** An integer in [{@link SEA_LEVEL_MIN}, {@link SEA_LEVEL_MAX}], above the committed sea level. */
+  readonly toSeaLevel: number;
+}
+
+/**
+ * The public address of the climate module's `refresh` operation (payload
+ * version 1, payload `{}`), which `raise-sea-level` emits as its consequence.
+ *
+ * This is a deliberate protocol-level coupling: terrain knows only this
+ * address, not climate's implementation. `lattice-climate-module` already
+ * depends on this package for the terrain record contract, so importing it
+ * here would be a cycle; the address is spelled out instead and must match
+ * what climate declares.
+ */
+export const CLIMATE_REFRESH_REQUEST: OperationRequest = Object.freeze({
+  moduleId: moduleId("climate"),
+  operation: "refresh",
+  payloadVersion: 1,
+  payload: Object.freeze({}),
+});
+
+/**
+ * The ID of the climate refresh that `raise-sea-level` to `toSeaLevel` emits
+ * at simulated time `now`: derived only from those two values, so the same
+ * run always emits the same ID.
+ */
+export function climateRefreshWorkId(now: number, toSeaLevel: number): WorkItemId {
+  return workItemId(`terrain-climate-refresh-${now}-${toSeaLevel}`);
+}
+
 const isIntegerIn = (value: unknown, min: number, max: number): value is number =>
   Number.isInteger(value) && !Object.is(value, -0) && (value as number) >= min && (value as number) <= max;
 
@@ -90,10 +123,25 @@ function isGenerateParams(payload: unknown): boolean {
   );
 }
 
-/** The module's one operation, `generate`, at payload version 1 with a {@link TerrainGenerateParams} payload. */
+function isRaiseSeaLevelParams(payload: unknown): boolean {
+  return (
+    isPlainRecord(payload) &&
+    hasExactKeys(payload, ["toSeaLevel"]) &&
+    isIntegerIn(payload.toSeaLevel, SEA_LEVEL_MIN, SEA_LEVEL_MAX)
+  );
+}
+
+/**
+ * The module's operations, each at payload version 1: `generate` with a
+ * {@link TerrainGenerateParams} payload and `raise-sea-level` with a
+ * {@link TerrainRaiseSeaLevelParams} payload.
+ */
 export const terrainModule: ModuleDefinition = {
   id: TERRAIN_MODULE,
-  operations: [{ name: "generate", version: 1, validatePayload: isGenerateParams }],
+  operations: [
+    { name: "generate", version: 1, validatePayload: isGenerateParams },
+    { name: "raise-sea-level", version: 1, validatePayload: isRaiseSeaLevelParams },
+  ],
 };
 
 /**
@@ -208,23 +256,54 @@ function generateElevation(seed: number): number[] {
 
 /**
  * Applies one validated terrain operation through the staged state view:
- * `generate` writes the `surface` record for the payload's seed and sea level,
- * replacing any earlier one. Throws if the request is not addressed to the
- * terrain module, so a misrouted request cannot write another module's state.
+ *
+ * - `generate` writes the `surface` record for the payload's seed and sea
+ *   level, replacing any earlier one.
+ * - `raise-sea-level` rewrites the committed `surface` record with the higher
+ *   sea level, keeping everything else, and emits {@link CLIMATE_REFRESH_REQUEST}
+ *   due at the same simulated time, under {@link climateRefreshWorkId}. Both
+ *   commit together or not at all. It throws, committing nothing, if no valid
+ *   `surface` record is committed, if the new sea level is not above the
+ *   committed one, or if no work emitter is supplied (it must run for a
+ *   scheduled work item of a realmlib operation runtime).
+ *
+ * Throws if the request is not addressed to the terrain module, so a misrouted
+ * request cannot write another module's state.
  */
-export const applyTerrainOperation: OperationHandler = (request, state) => {
+export const applyTerrainOperation: OperationHandler = (request, state, _random, emitter) => {
   if (request.moduleId !== TERRAIN_MODULE) {
     throw new Error(`terrain handler received a request for module ${JSON.stringify(request.moduleId)}`);
   }
-  if (request.operation !== "generate") throw new Error(`unhandled operation ${JSON.stringify(request.operation)}`);
-  const { seed, seaLevel } = request.payload as TerrainGenerateParams;
-  const record: TerrainRecord = {
-    schemaVersion: TERRAIN_SCHEMA_VERSION,
-    width: SURFACE_WIDTH,
-    height: SURFACE_HEIGHT,
-    seed,
-    seaLevel,
-    elevation: generateElevation(seed),
-  };
-  state.set(TERRAIN_KEY, record);
+  switch (request.operation) {
+    case "generate": {
+      const { seed, seaLevel } = request.payload as TerrainGenerateParams;
+      const record: TerrainRecord = {
+        schemaVersion: TERRAIN_SCHEMA_VERSION,
+        width: SURFACE_WIDTH,
+        height: SURFACE_HEIGHT,
+        seed,
+        seaLevel,
+        elevation: generateElevation(seed),
+      };
+      state.set(TERRAIN_KEY, record);
+      return;
+    }
+    case "raise-sea-level": {
+      const { toSeaLevel } = request.payload as TerrainRaiseSeaLevelParams;
+      const source = state.get(TERRAIN_MODULE, TERRAIN_KEY);
+      if (source === undefined) throw new Error("terrain surface has not been generated");
+      const current = parseTerrainRecord(source);
+      if (toSeaLevel <= current.seaLevel) {
+        throw new Error(`sea level can only rise: ${toSeaLevel} is not above the current ${current.seaLevel}`);
+      }
+      if (emitter === undefined) {
+        throw new Error("raise-sea-level needs a work emitter: run it for a scheduled work item of a realmlib operation runtime");
+      }
+      state.set(TERRAIN_KEY, { ...current, seaLevel: toSeaLevel });
+      emitter.emit({ id: climateRefreshWorkId(emitter.now, toSeaLevel), at: emitter.now, request: CLIMATE_REFRESH_REQUEST });
+      return;
+    }
+    default:
+      throw new Error(`unhandled operation ${JSON.stringify(request.operation)}`);
+  }
 };

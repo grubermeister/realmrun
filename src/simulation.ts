@@ -1,14 +1,32 @@
 /**
- * Runs a scenario (the accumulator fixture or the planet) against a freshly
- * migrated, empty realmlib database: the core initializes storage, schedules
- * and executes the work, and owns the clock. This module only wires the
- * scenario to it and reads the result back.
+ * Runs a scenario (the accumulator fixture, the planet, or the evolving
+ * planet) against a freshly migrated, empty realmlib database: the core
+ * initializes storage, schedules and executes the work, and owns the clock.
+ * This module only wires the scenario to it and reads the result back, at the
+ * end and at any checkpoints on the way.
  */
 
 import { initializePostgresSchedulerStorage, loadPostgresOperationRuntime, simTime } from "realmlib";
-import type { ModuleId, ModuleRegistry, OperationHandler, PostgresQueryable, ScheduledWork, SimTime, StateValue } from "realmlib";
+import type {
+  ModuleId,
+  ModuleRegistry,
+  OperationHandler,
+  PostgresOperationRuntime,
+  PostgresQueryable,
+  ScheduledWork,
+  SimTime,
+  StateValue,
+} from "realmlib";
 import { ACCUMULATOR_KEY, ACCUMULATOR_MODULE, applyFixtureOperation, createFixtureRegistry, FIXTURE_WORK } from "./fixture.ts";
-import { applyPlanetOperation, createPlanetRegistry, planetWork, readPlanetRecords } from "./planetary-fixture.ts";
+import type { PlanetSnapshot } from "./planet-snapshots.ts";
+import {
+  applyPlanetOperation,
+  createPlanetRegistry,
+  evolvingPlanetWork,
+  planetSnapshotTimes,
+  planetWork,
+  readPlanetRecords,
+} from "./planetary-fixture.ts";
 import type { PlanetConfig, PlanetRecords } from "./planetary-fixture.ts";
 
 /** Items per `advanceTo()` call; the loop continues until the target is reached. */
@@ -22,6 +40,12 @@ export interface FixtureResult {
 /** The planet's committed clock and records. */
 export interface PlanetResult extends PlanetRecords {
   readonly now: SimTime;
+}
+
+/** The evolving planet's final committed clock and records, and its checkpoints. */
+export interface PlanetEvolutionResult extends PlanetResult {
+  /** The committed records at each of {@link planetSnapshotTimes}, ascending; the last is at `now`. */
+  readonly snapshots: readonly PlanetSnapshot[];
 }
 
 /** The database is not a newly migrated, empty realmlib schema. */
@@ -64,14 +88,69 @@ interface Scenario<R> {
   readonly registry: ModuleRegistry;
   /** Executes each validated request. */
   readonly handler: OperationHandler;
-  /** Reads the result from committed state once the target is reached. */
+  /** Reads the result from committed state once the target (or a checkpoint) is reached. */
   readonly read: (read: (owner: ModuleId, key: string) => StateValue | undefined) => R;
+  /** Simulated times, ascending and none past the target, at which `read` also runs on the way. Default none. */
+  readonly checkpoints?: readonly SimTime[];
+}
+
+/** The parts of a realmlib operation runtime, PostgreSQL or in-memory, that advancing uses. */
+export type AdvancingRuntime = Pick<PostgresOperationRuntime, "scheduler" | "execute" | "read">;
+
+/** One read of committed state, at a checkpoint. */
+export interface Checkpoint<R> {
+  readonly at: SimTime;
+  readonly result: R;
+}
+
+/** Advances `runtime` to `target` in bounded batches, executing each due item with `scenario`'s handler. */
+async function advance(runtime: AdvancingRuntime, target: SimTime, scenario: Pick<Scenario<unknown>, "registry" | "handler">) {
+  let reached = false;
+  while (!reached) {
+    ({ reachedTarget: reached } = await runtime.scheduler.advanceTo(target, ADVANCE_BATCH, (work) => {
+      const outcome = runtime.execute(scenario.registry, work.request, scenario.handler);
+      if (!outcome.ok) throw new Error(`work ${work.id} rejected: ${outcome.reason}`);
+    }));
+  }
+}
+
+/**
+ * Advances `runtime`, whose work is already scheduled and which may advance
+ * (it owns its simulation, if that applies), to each of `scenario.checkpoints`
+ * and then to `until`. At each, once every item due by then has completed, it
+ * returns what `scenario.read` makes of the committed state. Each read gets
+ * its own copies of the records, so later operations cannot change it.
+ *
+ * @throws {RangeError} if the checkpoints do not ascend strictly or one is past `until`.
+ * @throws whatever advancing, executing, or reading throws.
+ */
+export async function advanceWithCheckpoints<R>(
+  runtime: AdvancingRuntime,
+  until: SimTime,
+  scenario: Pick<Scenario<R>, "registry" | "handler" | "read" | "checkpoints">,
+): Promise<{ now: SimTime; result: R; checkpoints: Checkpoint<R>[] }> {
+  const target = simTime(until);
+  const checkpoints = scenario.checkpoints ?? [];
+  checkpoints.forEach((at, index) => {
+    if (at > target || (index > 0 && at <= checkpoints[index - 1]!)) {
+      throw new RangeError(`checkpoints must ascend strictly and not pass the target ${target}: ${JSON.stringify(checkpoints)}`);
+    }
+  });
+  const read = (owner: ModuleId, key: string) => runtime.read(owner, key);
+  const captured: Checkpoint<R>[] = [];
+  for (const at of checkpoints) {
+    await advance(runtime, at, scenario);
+    captured.push({ at, result: scenario.read(read) });
+  }
+  await advance(runtime, target, scenario);
+  return { now: await runtime.scheduler.now(), result: scenario.read(read), checkpoints: captured };
 }
 
 /**
  * Initializes `scenario` in `client`'s database, takes driver ownership,
- * advances to `until`, and returns the committed clock and what
- * `scenario.read` makes of the committed state.
+ * advances to `until` (see {@link advanceWithCheckpoints}), and returns the
+ * committed clock and what `scenario.read` makes of the committed state, at
+ * the end and at each checkpoint.
  *
  * `client` must be one dedicated connection (such as a connected `pg.Client`);
  * the caller opens and ends it. Ownership is released before returning; if
@@ -81,8 +160,7 @@ async function runScenario<R>(
   client: PostgresQueryable,
   until: SimTime,
   scenario: Scenario<R>,
-): Promise<{ now: SimTime; result: R }> {
-  const target = simTime(until);
+): Promise<{ now: SimTime; result: R; checkpoints: Checkpoint<R>[] }> {
   await requireFreshDatabase(client);
   await initializePostgresSchedulerStorage(client, simTime(0));
 
@@ -95,19 +173,9 @@ async function runScenario<R>(
   if (!(await runtime.tryAcquireOwnership())) {
     throw new Error("another driver owns this simulation");
   }
-  let finished: { now: SimTime; result: R };
+  let finished: { now: SimTime; result: R; checkpoints: Checkpoint<R>[] };
   try {
-    let reached = false;
-    while (!reached) {
-      ({ reachedTarget: reached } = await runtime.scheduler.advanceTo(target, ADVANCE_BATCH, (work) => {
-        const outcome = runtime.execute(scenario.registry, work.request, scenario.handler);
-        if (!outcome.ok) throw new Error(`work ${work.id} rejected: ${outcome.reason}`);
-      }));
-    }
-    finished = {
-      now: await runtime.scheduler.now(),
-      result: scenario.read((owner, key) => runtime.read(owner, key)),
-    };
+    finished = await advanceWithCheckpoints(runtime, until, scenario);
   } catch (error) {
     // Keep the original error; the caller ends the connection, which drops any lock still held.
     await runtime.releaseOwnership().catch(() => {});
@@ -145,4 +213,27 @@ export async function runPlanet(client: PostgresQueryable, until: SimTime, confi
     read: readPlanetRecords,
   });
   return { now, ...result };
+}
+
+/**
+ * Runs the evolving planet scenario for `config` to `until` (see
+ * {@link runScenario}): the static planet's work plus the sea-level rise,
+ * whose climate refresh the terrain module emits. Returns the final committed
+ * clock and records, and the records at each of {@link planetSnapshotTimes}.
+ *
+ * @throws if either record is missing or invalid at any checkpoint.
+ */
+export async function runEvolvingPlanet(
+  client: PostgresQueryable,
+  until: SimTime,
+  config: PlanetConfig,
+): Promise<PlanetEvolutionResult> {
+  const { now, result, checkpoints } = await runScenario(client, until, {
+    work: evolvingPlanetWork(config),
+    registry: createPlanetRegistry(),
+    handler: applyPlanetOperation,
+    read: readPlanetRecords,
+    checkpoints: planetSnapshotTimes(until),
+  });
+  return { now, ...result, snapshots: checkpoints.map(({ at, result: records }) => ({ atMs: at, ...records })) };
 }

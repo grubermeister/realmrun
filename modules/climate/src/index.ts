@@ -1,13 +1,14 @@
 /**
  * The climate simulation module: a toy climatology derived from the terrain
  * module's committed `surface` record, owned by the `climate` module as its
- * `climate` record and written only by its `derive` operation.
+ * `climate` record and written only by its `derive` and `refresh` operations.
  *
- * `derive` reads terrain through realmlib's staged state view, never through a
- * copy in its payload, and writes only its own record. Its rules are simple,
- * explicitly approximate functions of latitude, elevation, and distance from
- * the ocean, meant for testing module architecture rather than describing any
- * real climate.
+ * Both read terrain through realmlib's staged state view, never through a copy
+ * in their payloads, and write only their own record. `refresh` is how climate
+ * follows a terrain change: terrain's `raise-sea-level` emits it. The climate
+ * rules are simple, explicitly approximate functions of latitude, elevation,
+ * and distance from the ocean, meant for testing module architecture rather
+ * than describing any real climate.
  *
  * This package depends on `lattice-terrain-module` only for that module's
  * public, read-only record contract. It does not register itself, schedule
@@ -96,10 +97,21 @@ function isDeriveParams(payload: unknown): boolean {
   );
 }
 
-/** The module's one operation, `derive`, at payload version 1 with a {@link ClimateDeriveParams} payload. */
+/** `refresh` takes exactly `{}`: everything it needs is committed state. */
+function isRefreshParams(payload: unknown): boolean {
+  return isPlainRecord(payload) && hasExactKeys(payload, []);
+}
+
+/**
+ * The module's operations, each at payload version 1: `derive` with a
+ * {@link ClimateDeriveParams} payload and `refresh` with the payload `{}`.
+ */
 export const climateModule: ModuleDefinition = {
   id: CLIMATE_MODULE,
-  operations: [{ name: "derive", version: 1, validatePayload: isDeriveParams }],
+  operations: [
+    { name: "derive", version: 1, validatePayload: isDeriveParams },
+    { name: "refresh", version: 1, validatePayload: isRefreshParams },
+  ],
 };
 
 /**
@@ -237,20 +249,37 @@ function deriveClimate(terrain: TerrainRecord, meanTempC: number): ClimateRecord
 }
 
 /**
- * Applies one validated climate operation through the staged state view:
- * `derive` reads terrain's committed `surface` record with `state.get()` and
- * writes the `climate` record, replacing any earlier one.
+ * Applies one validated climate operation through the staged state view. Each
+ * reads terrain's committed `surface` record with `state.get()` and writes the
+ * `climate` record, replacing any earlier one:
+ *
+ * - `derive` uses the payload's baseline temperature.
+ * - `refresh` keeps the baseline of the committed `climate` record, so climate
+ *   follows a terrain change without being told the baseline again.
  *
  * Throws, so nothing is committed, if terrain has not been generated, if its
- * record is malformed or of an unsupported schema version, or if the request is
- * not addressed to the climate module.
+ * record (or, for `refresh`, climate's own) is missing, malformed, or of an
+ * unsupported schema version, or if the request is not addressed to the
+ * climate module.
  */
 export const applyClimateOperation: OperationHandler = (request, state) => {
   if (request.moduleId !== CLIMATE_MODULE) {
     throw new Error(`climate handler received a request for module ${JSON.stringify(request.moduleId)}`);
   }
-  if (request.operation !== "derive") throw new Error(`unhandled operation ${JSON.stringify(request.operation)}`);
-  const { meanTempC } = request.payload as ClimateDeriveParams;
+  let meanTempC: number;
+  switch (request.operation) {
+    case "derive":
+      ({ meanTempC } = request.payload as ClimateDeriveParams);
+      break;
+    case "refresh": {
+      const prior = state.get(CLIMATE_MODULE, CLIMATE_KEY);
+      if (prior === undefined) throw new Error("climate has not been derived");
+      ({ meanTempC } = parseClimateRecord(prior));
+      break;
+    }
+    default:
+      throw new Error(`unhandled operation ${JSON.stringify(request.operation)}`);
+  }
   const source = state.get(TERRAIN_MODULE, TERRAIN_KEY);
   if (source === undefined) throw new Error("terrain surface has not been generated");
   state.set(CLIMATE_KEY, deriveClimate(parseTerrainRecord(source), meanTempC));
