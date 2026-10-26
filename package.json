@@ -4,15 +4,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun run src/main.ts",
+    "start": "node init && bun run src/main.ts",
     "db:reset": "bun run scripts/reset-dev-db.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "viewer:build": "bun build ./viewer/src/main.ts --target browser --format esm --outdir ./viewer/dist",
+    "viewer:typecheck": "tsc -p viewer/tsconfig.json --noEmit"
   },
   "dependencies": {
+    "dotenv": "^8.2.0",
     "lattice-accumulator-module": "file:./modules/accumulator",
     "lattice-climate-module": "file:./modules/climate",
     "lattice-terrain-module": "file:./modules/terrain",
+    "node-fetch": "^3.3.2",
     "pg": "^8.23.1",
     "realmlib": "file:../realmlib"
   },

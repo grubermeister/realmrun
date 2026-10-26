@@ -9,6 +9,7 @@
 
 import { createInMemoryOperationRuntime, createInMemoryScheduler, createInMemoryStateStore, executeInMemoryOperation } from "realmlib";
 import type { InMemoryOperationRuntime, SimTime, StateValue } from "realmlib";
+import { buildSnapshotBundle, serializeSnapshotBundle } from "../src/planet-snapshots.ts";
 import type { PlanetSnapshot } from "../src/planet-snapshots.ts";
 import { ACCUMULATOR_KEY, ACCUMULATOR_MODULE, applyFixtureOperation, createFixtureRegistry, FIXTURE_WORK } from "../src/fixture.ts";
 import {
@@ -100,4 +101,14 @@ export async function runEvolvingPlanetInMemory(
     snapshots.push({ atMs: target, ...readPlanetRecords((owner, key) => runtime.read(owner, key)) });
   }
   return { runtime, now: await runtime.scheduler.now(), snapshots, executed };
+}
+
+/**
+ * The text `--export-snapshots` writes for the evolving planet's run of
+ * `config` to `until`, built from the in-memory reference run with D1's own
+ * bundle builder and serializer.
+ */
+export async function exportedSnapshotsInMemory(config: PlanetConfig, until: SimTime): Promise<string> {
+  const { snapshots } = await runEvolvingPlanetInMemory(config, until);
+  return serializeSnapshotBundle(buildSnapshotBundle(config, snapshots));
 }

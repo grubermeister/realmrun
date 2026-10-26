@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Local files only: no fetches, uploads, or outside assets. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'" />
+    <title>Planet Snapshot Viewer</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./dist/main.js"></script>
+  </head>
+  <body>
+    <header class="page-header">
+      <div>
+        <h1>Planet snapshot viewer</h1>
+        <p class="subtitle">Read-only view of a <code>realmrun --scenario planet-evolve --export-snapshots</code> file. Nothing is simulated here.</p>
+      </div>
+      <label class="file-picker">
+        <span>Choose snapshot JSON…</span>
+        <input id="file" type="file" accept=".json,application/json" />
+      </label>
+    </header>
+
+    <p id="status" class="status" role="status">
+      No file loaded. Choose a <code>lattice.planet.snapshots</code> file (format version 1) exported by realmrun. It is read
+      in this browser and never uploaded.
+    </p>
+
+    <main id="view" hidden>
+      <section class="source" aria-label="Loaded file">
+        <dl id="source-details"></dl>
+      </section>
+
+      <section class="controls" aria-label="View controls">
+        <fieldset>
+          <legend>Layer</legend>
+          <div id="layers" class="segmented"></div>
+        </fieldset>
+        <fieldset>
+          <legend>Saved checkpoint (simulated ms)</legend>
+          <div id="checkpoints" class="segmented"></div>
+        </fieldset>
+      </section>
+
+      <section class="maps" aria-label="Maps">
+        <figure>
+          <figcaption id="baseline-caption"></figcaption>
+          <div class="map-frame">
+            <span class="axis north">N</span>
+            <canvas id="baseline-map" width="48" height="24"></canvas>
+            <span class="axis south">S</span>
+          </div>
+        </figure>
+        <figure>
+          <figcaption id="selected-caption"></figcaption>
+          <div class="map-frame">
+            <span class="axis north">N</span>
+            <canvas id="selected-map" width="48" height="24"></canvas>
+            <span class="axis south">S</span>
+          </div>
+        </figure>
+      </section>
+      <p class="map-note">
+        48 × 24 cells, one square per cell, row 0 (north) at the top. Columns run west to east around the planet; the left and right
+        edges are neighbours. Equirectangular, so polar rows look larger than they are.
+      </p>
+      <p id="inspector" class="inspector">Point at a map cell to read its saved values.</p>
+
+      <div class="panels">
+        <section class="panel" aria-labelledby="legend-title">
+          <h2 id="legend-title">Legend</h2>
+          <div id="legend"></div>
+        </section>
+
+        <section class="panel" aria-labelledby="difference-title">
+          <h2 id="difference-title">Difference from baseline</h2>
+          <div id="difference"></div>
+        </section>
+
+        <section class="panel" aria-labelledby="events-title">
+          <h2 id="events-title">Recorded events</h2>
+          <div id="events"></div>
+        </section>
+      </div>
+
+      <section class="panel" aria-labelledby="metrics-title">
+        <h2 id="metrics-title">Checkpoint statistics</h2>
+        <div id="metrics"></div>
+        <p class="note">Shares are percentages of the 1152 raster cells, not of the planet's surface area: the grid is not equal-area.</p>
+      </section>
+    </main>
+  </body>
+</html>

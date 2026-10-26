@@ -358,11 +358,21 @@ The same options in a freshly reset database produce **byte-identical** files:
 key order, snapshot order, and formatting are fixed, and the file holds no
 timestamps, paths, random IDs, or connection details.
 
+To inspect an exported file in a browser, use the static, read-only
+[planet snapshot viewer](viewer/README.md):
+
+```sh
+bun run viewer:build
+python3 -m http.server 8000 --directory viewer   # then open http://localhost:8000/
+```
+
 ## Development
 
 ```sh
-bun test             # CLI, scenario, renderer, and module tests; PostgreSQL tests are skipped
-bun run typecheck    # strict TypeScript check
+bun test                  # CLI, scenario, renderer, module, and viewer tests; PostgreSQL tests are skipped
+bun run typecheck         # strict TypeScript check
+bun run viewer:typecheck  # the viewer's own DOM-enabled check
+bun run viewer:build      # bundle the viewer into viewer/dist/
 ```
 
 The PostgreSQL tests run every scenario through realmlib's PostgreSQL operation
