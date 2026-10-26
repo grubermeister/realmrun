@@ -1,0 +1,20 @@
+{
+  "name": "realmrun",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.23.1",
+    "realmlib": "file:../realmlib"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "@types/pg": "^8.23.1",
+    "typescript": "^7.0.2"
+  }
+}
