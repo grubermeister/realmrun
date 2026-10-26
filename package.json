@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/main.ts",
+    "db:reset": "bun run scripts/reset-dev-db.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

@@ -48,14 +48,31 @@ existing local PostgreSQL 18 server with `psql` and `createdb`/`dropdb`.
 ```sh
 bun install   # also installs the packages in modules/; rerun after changing them
 
-# A separate development database; realmlib requires UTF8.
-export DATABASE_URL=postgresql://USER:PASSWORD@localhost:5432/realmrun_dev
+# A separate development database; realmlib requires UTF8. Bun loads .env
+# automatically (it is gitignored), so nothing needs exporting.
+echo 'DATABASE_URL=postgresql://USER:PASSWORD@localhost:5432/realmrun_dev' > .env
 # or, as the local superuser over a Unix socket in /tmp:
-#   export DATABASE_URL='postgresql:///realmrun_dev?host=/tmp'   (and pass -h /tmp below)
-createdb --encoding=UTF8 --template=template0 realmrun_dev   # add -h/-U as needed
+#   echo 'DATABASE_URL=postgresql:///realmrun_dev?host=/tmp' > .env
 
-# Apply realmlib's existing schema in one transaction.
-psql "$DATABASE_URL" --single-transaction --file node_modules/realmlib/migrations/001_initial_persistence.sql
+# (Re)create it as a new UTF8 database with realmlib's schema applied.
+bun run db:reset
+```
+
+A `DATABASE_URL` set in the environment takes precedence over `.env`.
+
+`bun run db:reset` drops the database named by `DATABASE_URL`, creates it
+again (UTF8, from `template0`), and applies realmlib's migration in one
+transaction. **Everything in that database is destroyed.** As a guard, it only
+resets databases named `realmrun_` followed by letters, digits, or
+underscores, and it fails rather than disconnecting anyone if the database is
+in use. The user in `DATABASE_URL` needs permission to create databases.
+
+To do the same by hand:
+
+```sh
+dropdb --if-exists realmrun_dev                               # add -h/-U as needed
+createdb --encoding=UTF8 --template=template0 realmrun_dev
+psql -d realmrun_dev --single-transaction --file node_modules/realmlib/migrations/001_initial_persistence.sql
 ```
 
 ## Usage
@@ -96,12 +113,10 @@ out-of-range or malformed number, or a planet option without
 
 Each run needs a **newly initialized** database. If the database already holds
 a simulation, realmrun refuses to run rather than overwrite it. To run again,
-recreate the database and reapply the schema:
+reset it first:
 
 ```sh
-dropdb realmrun_dev
-createdb --encoding=UTF8 --template=template0 realmrun_dev
-psql "$DATABASE_URL" --single-transaction --file node_modules/realmlib/migrations/001_initial_persistence.sql
+bun run db:reset && bun run start --until 12
 ```
 
 ## The fixture
@@ -130,6 +145,7 @@ elevation field and a toy climate derived from it, generated once at simulated
 time 0. It is not a scientific model, and nothing evolves afterwards.
 
 ```sh
+bun run db:reset
 bun run start --scenario planet --seed 1729 --sea-level 0 --mean-temp 15 --until 0
 ```
 
