@@ -9,6 +9,25 @@ it can (no real-time pacing, no game server), and prints the committed result.
 This is an alpha development tool. It depends on the adjacent `realmlib`
 checkout through `file:../realmlib`.
 
+## Intended use
+
+realmrun is the offline laboratory for portable simulation modules: a place to
+run simulation experiments on the same `realmlib` core without real-time
+pacing. It is separate from the other Lattice processes, neither of which is
+part of this repository:
+
+- **`realmlord`**, the planned live world host and coordinator for long-lived,
+  independent realms. It has not been written yet.
+- **`edgelord`**, the existing player-facing gameplay server.
+
+The longer-term aim is for realmrun to run experiments built from the same
+independent modules that `realmlord` will host, including several modules
+together. **Today it does not.** realmrun runs exactly one built-in fixture
+(the numeric accumulator described below) against one PostgreSQL database per
+run. It has no module loader or plugin system, no realm configuration, and no
+multi-realm orchestration; changing the experiment means editing
+[`src/fixture.ts`](src/fixture.ts).
+
 ## Setup
 
 Requirements: Bun, a `realmlib` checkout next to this repository, and an
