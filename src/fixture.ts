@@ -1,48 +1,30 @@
 /**
- * The test fixture: one numeric accumulator owned by a single module, changed
- * only by scheduled operations that realmlib validates and executes.
+ * The test fixture: the accumulator module from `lattice-accumulator-module`,
+ * changed only by scheduled operations that realmlib validates and executes.
  *
+ * The module package only declares the module and handles its operations; this
+ * file registers it, selects its handler for dispatch, and defines the work.
  * realmlib has no direct state-seeding API, so the accumulator's initial value
  * is written by a `set` operation at simulation time 0, scheduled first.
  * Kept separate from the CLI so a later experiment can replace it.
  */
 
-import { createModuleRegistry, moduleId, simTime, workItemId } from "realmlib";
+import { ACCUMULATOR_KEY, ACCUMULATOR_MODULE, accumulatorModule, applyAccumulatorOperation } from "lattice-accumulator-module";
+import { createModuleRegistry, simTime, workItemId } from "realmlib";
 import type { ModuleRegistry, OperationHandler, ScheduledWork } from "realmlib";
 
-export const ACCUMULATOR_MODULE = moduleId("accumulator");
-export const ACCUMULATOR_KEY = "value";
+export { ACCUMULATOR_KEY, ACCUMULATOR_MODULE };
 export const INITIAL_VALUE = 1;
-
-const isFiniteNumber = (payload: unknown): boolean => typeof payload === "number" && Number.isFinite(payload);
 
 /** A new registry accepting the accumulator module's operations. */
 export function createFixtureRegistry(): ModuleRegistry {
   const registry = createModuleRegistry();
-  registry.register({
-    id: ACCUMULATOR_MODULE,
-    operations: [
-      { name: "set", version: 1, validatePayload: isFiniteNumber },
-      { name: "add", version: 1, validatePayload: isFiniteNumber },
-      { name: "multiply", version: 1, validatePayload: isFiniteNumber },
-    ],
-  });
+  registry.register(accumulatorModule);
   return registry;
 }
 
-/** Applies one validated accumulator operation through the staged state view. */
-export const applyFixtureOperation: OperationHandler = (request, state) => {
-  const operand = request.payload as number;
-  if (request.operation === "set") {
-    state.set(ACCUMULATOR_KEY, operand);
-    return;
-  }
-  const current = state.get(request.moduleId, ACCUMULATOR_KEY);
-  if (typeof current !== "number") throw new Error("accumulator is not initialized");
-  if (request.operation === "add") state.set(ACCUMULATOR_KEY, current + operand);
-  else if (request.operation === "multiply") state.set(ACCUMULATOR_KEY, current * operand);
-  else throw new Error(`unhandled operation ${JSON.stringify(request.operation)}`);
-};
+/** The handler the fixture's work is executed with. */
+export const applyFixtureOperation: OperationHandler = applyAccumulatorOperation;
 
 function work(id: string, at: number, operation: string, payload: number): ScheduledWork {
   return {

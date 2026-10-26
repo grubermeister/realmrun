@@ -7,7 +7,9 @@ a fixture in PostgreSQL, asks realmlib to advance to a simulated time as fast as
 it can (no real-time pacing, no game server), and prints the committed result.
 
 This is an alpha development tool. It depends on the adjacent `realmlib`
-checkout through `file:../realmlib`.
+checkout through `file:../realmlib`, and on the local package
+[`lattice-accumulator-module`](modules/accumulator) through
+`file:./modules/accumulator`.
 
 ## Intended use
 
@@ -24,7 +26,9 @@ The longer-term aim is for realmrun to run experiments built from the same
 independent modules that `realmlord` will host, including several modules
 together. **Today it does not.** realmrun runs exactly one built-in fixture
 (the numeric accumulator described below) against one PostgreSQL database per
-run. It has no module loader or plugin system, no realm configuration, and no
+run. The accumulator itself lives in a separate, host-independent package,
+[`modules/accumulator`](modules/accumulator), which realmrun imports by name.
+It has no module loader or plugin system, no realm configuration, and no
 multi-realm orchestration; changing the experiment means editing
 [`src/fixture.ts`](src/fixture.ts).
 
@@ -34,7 +38,7 @@ Requirements: Bun, a `realmlib` checkout next to this repository, and an
 existing local PostgreSQL 18 server with `psql` and `createdb`/`dropdb`.
 
 ```sh
-bun install
+bun install   # also installs modules/accumulator; rerun after changing it
 
 # A separate development database; realmlib requires UTF8.
 export DATABASE_URL=postgresql://USER:PASSWORD@localhost:5432/realmrun_dev
@@ -73,8 +77,10 @@ psql "$DATABASE_URL" --single-transaction --file node_modules/realmlib/migration
 
 ## The fixture
 
-[`src/fixture.ts`](src/fixture.ts) defines one module, `accumulator`, owning a
-numeric record `value`, and its scheduled work in insertion order:
+[`src/fixture.ts`](src/fixture.ts) registers one module, `accumulator` from
+[`lattice-accumulator-module`](modules/accumulator/README.md), owning a numeric
+record `value`, selects its handler, and defines its scheduled work in
+insertion order:
 
 | Simulated time (ms) | Operation     | Result |
 |--------------------:|---------------|-------:|
@@ -91,7 +97,7 @@ as the rest. No random seed is used. Expected results: `--until 0` â†’ 1, `5` â†
 ## Development
 
 ```sh
-bun test             # CLI validation and fixture tests; PostgreSQL tests are skipped
+bun test             # CLI, fixture, and module tests; PostgreSQL tests are skipped
 bun run typecheck    # strict TypeScript check
 ```
 
