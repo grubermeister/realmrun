@@ -2,8 +2,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { join } from "node:path";
 import pg from "pg";
 import { simTime } from "realmlib";
-import { DatabaseNotReadyError, runFixture } from "../src/simulation.ts";
-import { runFixtureInMemory } from "./in-memory-reference.ts";
+import { DEFAULT_PLANET_CONFIG, readPlanetRecords, TERRAIN_MODULE } from "../src/planetary-fixture.ts";
+import type { PlanetConfig } from "../src/planetary-fixture.ts";
+import { renderPlanetMap } from "../src/planetary-map.ts";
+import { DatabaseNotReadyError, runFixture, runPlanet } from "../src/simulation.ts";
+import { runFixtureInMemory, runPlanetInMemory } from "./in-memory-reference.ts";
 
 // Opt-in: runs only against a separate, disposable database named by this variable.
 const databaseUrl = process.env.REALMRUN_TEST_DATABASE_URL;
@@ -29,8 +32,7 @@ function definePostgresTests(url: string): void {
     }
   });
 
-  /** Each test gets a newly migrated, empty schema and its own driver connection. */
-  beforeEach(async () => {
+  async function migrate(): Promise<void> {
     const migration = await Bun.file(migrationPath).text();
     await observer.query("BEGIN");
     try {
@@ -41,6 +43,11 @@ function definePostgresTests(url: string): void {
       throw error;
     }
     migrated = true;
+  }
+
+  /** Each test gets a newly migrated, empty schema and its own driver connection. */
+  beforeEach(async () => {
+    await migrate();
     driver = new pg.Client({ connectionString: url });
     driver.on("error", () => {});
     await driver.connect();
@@ -102,6 +109,96 @@ function definePostgresTests(url: string): void {
       const [code, stdout, stderr] = await Promise.all([child.exited, child.stdout.text(), child.stderr.text()]);
       expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
       expect(stdout).toBe("Simulated time: 12 ms\nAccumulator: 13\n");
+    });
+  });
+
+  describe("planet scenario through the PostgreSQL operation runtime", () => {
+    const committedRows = async () =>
+      (
+        await observer.query(
+          "SELECT module_id, record_key, value::text AS value FROM realmlib.state_records ORDER BY module_id, record_key",
+        )
+      ).rows.map((r) => ({ module: r.module_id, key: r.record_key, value: JSON.parse(r.value) }));
+
+    const advisoryLocks = async () =>
+      (
+        await observer.query(`SELECT count(*)::int AS n FROM pg_locks
+           WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`)
+      ).rows[0].n;
+
+    test.each([
+      [DEFAULT_PLANET_CONFIG, 0],
+      [{ seed: 42, seaLevel: 5, meanTempC: 3 } satisfies PlanetConfig, 0],
+      [DEFAULT_PLANET_CONFIG, 1_000],
+    ])("%j to %d ms matches the in-memory core path and commits both modules' records", async (config, until) => {
+      const result = await runPlanet(driver, simTime(until), config);
+      const reference = await runPlanetInMemory(config, simTime(until));
+      expect(result).toEqual({ now: reference.now, terrain: reference.terrain as never, climate: reference.climate as never });
+      expect(result.terrain).toMatchObject({ seed: config.seed, seaLevel: config.seaLevel });
+      expect(result.climate).toMatchObject({ meanTempC: config.meanTempC });
+
+      // What committed, seen from another connection: one record per module, each in its own namespace.
+      expect(await committedRows()).toEqual([
+        { module: "climate", key: "climate", value: reference.climate },
+        { module: "terrain", key: "surface", value: reference.terrain },
+      ]);
+      const state = await observer.query("SELECT now_ms::text AS now FROM realmlib.runtime_state");
+      expect(state.rows).toEqual([{ now: String(until) }]);
+      const work = await observer.query("SELECT work_id, module_id, at_ms::int AS at, status FROM realmlib.work_items ORDER BY sequence");
+      expect(work.rows).toEqual([
+        { work_id: "planet-terrain-generate", module_id: "terrain", at: 0, status: "completed" },
+        { work_id: "planet-climate-derive", module_id: "climate", at: 0, status: "completed" },
+      ]);
+      expect(work.rows.map((r) => r.work_id)).toEqual(reference.executed);
+      expect(await advisoryLocks()).toBe(0);
+    });
+
+    test("an already generated planet is refused and left unchanged", async () => {
+      await runPlanet(driver, simTime(0), DEFAULT_PLANET_CONFIG);
+      const before = await committedRows();
+      await expect(runPlanet(driver, simTime(0), { ...DEFAULT_PLANET_CONFIG, seed: 42 })).rejects.toThrow(DatabaseNotReadyError);
+      await expect(runFixture(driver, simTime(0))).rejects.toThrow(DatabaseNotReadyError);
+      expect(await committedRows()).toEqual(before);
+      expect(await advisoryLocks()).toBe(0);
+    });
+
+    test("a database holding the accumulator fixture is refused", async () => {
+      await runFixture(driver, simTime(0));
+      await expect(runPlanet(driver, simTime(0), DEFAULT_PLANET_CONFIG)).rejects.toThrow("already holds a simulation");
+      expect((await committedRows()).map((r) => r.module)).toEqual(["accumulator"]);
+    });
+
+    test("the CLI prints the map of the committed planet, identically on a fresh rerun, and differently for another seed", async () => {
+      await driver.end();
+      const run = async (...args: string[]) => {
+        const child = Bun.spawn(["bun", mainPath, "--scenario", "planet", ...args], {
+          env: { ...process.env, DATABASE_URL: url },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [code, stdout, stderr] = await Promise.all([child.exited, child.stdout.text(), child.stderr.text()]);
+        expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+        return stdout;
+      };
+      const fresh = async () => {
+        await observer.query("DROP SCHEMA realmlib CASCADE");
+        migrated = false;
+        await migrate();
+      };
+
+      const first = await run("--seed", "1729", "--sea-level", "0", "--mean-temp", "15", "--until", "0");
+      const reference = await runPlanetInMemory(DEFAULT_PLANET_CONFIG, simTime(0));
+      const records = readPlanetRecords((owner) => (owner === TERRAIN_MODULE ? reference.terrain : reference.climate));
+      expect(first).toBe(`${renderPlanetMap({ ...records, now: reference.now })}\n`);
+      expect(first.split("\n").filter((line) => /^[ 0-9]{2}[NS] \|.{48}\|$/.test(line))).toHaveLength(24);
+
+      await fresh();
+      expect(await run("--until", "0")).toBe(first); // the defaults are the sample planet
+
+      await fresh();
+      const reseeded = await run("--seed", "42", "--until", "0");
+      expect(reseeded).not.toBe(first);
+      expect(reseeded).toStartWith("Planet: seed 42, sea level 0, mean temperature 15 C\n");
     });
   });
 

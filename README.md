@@ -7,9 +7,11 @@ a fixture in PostgreSQL, asks realmlib to advance to a simulated time as fast as
 it can (no real-time pacing, no game server), and prints the committed result.
 
 This is an alpha development tool. It depends on the adjacent `realmlib`
-checkout through `file:../realmlib`, and on the local package
-[`lattice-accumulator-module`](modules/accumulator) through
-`file:./modules/accumulator`.
+checkout through `file:../realmlib`, and on three local module packages
+through `file:./modules/...`:
+[`lattice-accumulator-module`](modules/accumulator),
+[`lattice-terrain-module`](modules/terrain), and
+[`lattice-climate-module`](modules/climate).
 
 ## Intended use
 
@@ -23,14 +25,20 @@ part of this repository:
 - **`edgelord`**, the existing player-facing gameplay server.
 
 The longer-term aim is for realmrun to run experiments built from the same
-independent modules that `realmlord` will host, including several modules
-together. **Today it does not.** realmrun runs exactly one built-in fixture
-(the numeric accumulator described below) against one PostgreSQL database per
-run. The accumulator itself lives in a separate, host-independent package,
-[`modules/accumulator`](modules/accumulator), which realmrun imports by name.
-It has no module loader or plugin system, no realm configuration, and no
-multi-realm orchestration; changing the experiment means editing
-[`src/fixture.ts`](src/fixture.ts).
+independent modules that `realmlord` will host. **Today it does so only in a
+small, fixed way.** realmrun runs exactly two built-in scenarios, each against
+one PostgreSQL database per run:
+
+- the **accumulator fixture** (the default), one numeric module; and
+- the **planet scenario**, two modules where one reads the other's committed
+  state: a seeded terrain surface and a climate derived from it.
+
+Each module lives in a separate, host-independent package under
+[`modules/`](modules), which realmrun imports by name. realmrun has no module
+loader or plugin system, no realm configuration, and no multi-realm
+orchestration; changing an experiment means editing
+[`src/fixture.ts`](src/fixture.ts) or
+[`src/planetary-fixture.ts`](src/planetary-fixture.ts).
 
 ## Setup
 
@@ -38,7 +46,7 @@ Requirements: Bun, a `realmlib` checkout next to this repository, and an
 existing local PostgreSQL 18 server with `psql` and `createdb`/`dropdb`.
 
 ```sh
-bun install   # also installs modules/accumulator; rerun after changing it
+bun install   # also installs the packages in modules/; rerun after changing them
 
 # A separate development database; realmlib requires UTF8.
 export DATABASE_URL=postgresql://USER:PASSWORD@localhost:5432/realmrun_dev
@@ -52,6 +60,8 @@ psql "$DATABASE_URL" --single-transaction --file node_modules/realmlib/migration
 
 ## Usage
 
+The default scenario is the accumulator fixture:
+
 ```sh
 bun run start --until 12
 ```
@@ -63,7 +73,26 @@ Accumulator: 13
 
 `--until` (also `--until=12`) is required: a nonnegative safe integer number of
 simulated milliseconds. Malformed values, including `-0`, exit with status 2;
-database and runtime errors exit with status 1.
+database and runtime errors exit with status 1. For the planet scenario, see
+[below](#the-planet-scenario).
+
+### Options
+
+Every option takes a value, as `--flag value` or `--flag=value`, and may be
+given at most once. Numbers are plain decimal digits: no `+`, leading zeros,
+exponents, fractions, or `-0`.
+
+| Option         | Scenarios | Default       | Meaning                                                                 |
+|----------------|-----------|---------------|-------------------------------------------------------------------------|
+| `--until`      | both      | required      | Simulated milliseconds to advance to: `0` to `9007199254740991`         |
+| `--scenario`   | both      | `accumulator` | `accumulator` or `planet`                                               |
+| `--seed`       | planet    | `1729`        | Terrain seed: an unsigned 32-bit integer, `0` to `4294967295`           |
+| `--sea-level`  | planet    | `0`           | Terrain sea level: an integer from `-100` to `100`; cells above it are land |
+| `--mean-temp`  | planet    | `15`          | Climate baseline temperature: an integer from `-40` to `40` (°C)        |
+
+An unknown scenario or option, a duplicated option, a missing value, an
+out-of-range or malformed number, or a planet option without
+`--scenario planet` exits with status 2 and the usage text.
 
 Each run needs a **newly initialized** database. If the database already holds
 a simulation, realmrun refuses to run rather than overwrite it. To run again,
@@ -94,15 +123,108 @@ by the `set` operation at time 0, through the same module-owned execution path
 as the rest. No random seed is used. Expected results: `--until 0` → 1, `5` → 9,
 `12` → 13, `20` → 13 (clock at the requested time in each case).
 
+## The planet scenario
+
+A deliberately simplified planetary *surface* experiment: a coarse, static
+elevation field and a toy climate derived from it, generated once at simulated
+time 0. It is not a scientific model, and nothing evolves afterwards.
+
+```sh
+bun run start --scenario planet --seed 1729 --sea-level 0 --mean-temp 15 --until 0
+```
+
+[`src/planetary-fixture.ts`](src/planetary-fixture.ts) registers two modules
+in one registry and schedules one operation for each, in this insertion order:
+
+| Order | Work ID                   | Time (ms) | Module    | Operation  | Payload                  |
+|------:|---------------------------|----------:|-----------|------------|--------------------------|
+| 1     | `planet-terrain-generate` | 0         | `terrain` | `generate` | `{ seed, seaLevel }`     |
+| 2     | `planet-climate-derive`   | 0         | `climate` | `derive`   | `{ meanTempC }`          |
+
+- [`lattice-terrain-module`](modules/terrain/README.md) writes its `surface`
+  record: 48 × 24 seeded, longitude-wrapped elevations.
+- [`lattice-climate-module`](modules/climate/README.md) reads that record
+  through realmlib's state view, `state.get("terrain", "surface")`, and writes
+  only its own `climate` record: temperature, moisture, and a biome per cell.
+  Its payload carries no terrain data.
+
+Both items are due at time 0, and realmlib runs equal times in insertion order,
+each in its own transaction, so climate reads terrain's **committed** record.
+Scheduled the other way round, climate fails (`terrain surface has not been
+generated`), commits nothing, and stays pending. Neither handler schedules
+work; a later `--until` only moves the clock.
+
+realmrun routes each request, after realmlib's registry has validated it, to
+the handler of the module it is addressed to: a two-entry map from module ID to
+handler in `applyPlanetOperation`. After advancing, it reads both committed
+records back through the runtime (`runtime.read()`), checks them against each
+module's record contract, and renders them with
+[`src/planetary-map.ts`](src/planetary-map.ts), a pure text renderer with no
+database access. The header's seed, sea level, and mean temperature come from
+those committed records.
+
+The same inputs always print the same map; another seed gives another planet.
+Raising `--sea-level` floods more of the same terrain; lowering
+`--mean-temp` spreads ice and tundra. The output of the command above:
+
+```text
+Planet: seed 1729, sea level 0, mean temperature 15 C
+Grid: 48 x 24 cells, rows north to south, columns wrap east-west
+Simulated time: 0 ms
+
+    +------------------------------------------------+
+86N |**~~~~~***********************~~~~~~~~~~~~~~~~~*|
+79N |***~~~~************************~~~~~~~~~~~~~~~~*|
+71N |*******************************~~~~~~~~~~~~~~~~~|
+64N |-------**************----****---~~~~~~~~~~~~~~~-|
+56N |--------**********----tttt----tt~~~~~~~~~~~~~~t-|
+49N |"..-------****------tt~~~~tt"tttt~~~~~~~~~~~~tt"|
+41N |........------.....""t~~~~~t"t~t"t~~~~~~~~~~~t""|
+34N |....................""~~~~~""~~""""~~~~~~~~~""..|
+26N |.....................""~~~~""~~~"""~~~~~~""""...|
+19N |....................""t~~~~~~~~~t"t~~~~tt""""...|
+11N |".................""tT~~~~~~~~~~~TT~~~Ttt""""...|
+ 4N |t""...""........""ttTT~~~~~~~~~~~~~~~~TTt"""".""|
+ 4S |Tt"".""""......""tTTT~~~~~~~~~~~~~~~~~TTt""""""t|
+11S |Tt"".""""......""tTT~~~~~~~~~~~~~~~~~~Tt"""""""t|
+19S |~t"".""""......""t~~~~~ttt~~~~~~~~~ttt"t"""""""t|
+26S |~~"".""""......""~~~~~~"""~~~~~~~~"""""~"""""""~|
+34S |~~""""~~"".....""~~~~~~""""""~~~~~""""~~~~~~"""~|
+41S |~t""t~~~~t"""""t~~~~~~~t"""""ttt~~ttt~~~~~~~~~~~|
+49S |tt"tt~~~~~ttttt~~~~~~~tt"""""ttt~~~~~~~~~~~~~~tt|
+56S |----t~~~~~~~~~~~~~~~~t-------tt~~~~~~~~~~~~~t---|
+64S |**----~~~~~~~~~~~~~~---****---~~~~~~~~~~~~~~-***|
+71S |*******~~~~~~~~~~~~***********~~~~~~~~~~~~~*****|
+79S |******~~~~~~~~~~~**************~~~~~~~~~~~******|
+86S |******~~~~~~~~~****************~~~~~~~~~~*******|
+    +------------------------------------------------+
+
+Surface: ocean 457 cells (39.7%), land 695 cells (60.3%)
+
+  Biome            Cells  Share
+~ ocean              457  39.7%
+* ice                204  17.7%
+- tundra              76   6.6%
+. desert             149  12.9%
+" grassland          163  14.1%
+t forest              85   7.4%
+T tropical forest     18   1.6%
+```
+
+Rows are labelled with their latitude; columns run around the planet and wrap
+at the edges. The map is an equirectangular approximation, so polar rows
+exaggerate their area. As with the accumulator, each run needs a newly
+initialized database, and a populated one is refused.
+
 ## Development
 
 ```sh
-bun test             # CLI, fixture, and module tests; PostgreSQL tests are skipped
+bun test             # CLI, scenario, renderer, and module tests; PostgreSQL tests are skipped
 bun run typecheck    # strict TypeScript check
 ```
 
-The PostgreSQL tests run the fixture through realmlib's PostgreSQL operation
-runtime and compare it with realmlib's in-memory core path. They are opt-in and
+The PostgreSQL tests run both scenarios through realmlib's PostgreSQL operation
+runtime and compare them with realmlib's in-memory core path. They are opt-in and
 need a separate, **disposable** UTF8 database without a `realmlib` schema; they
 apply the migration and drop the schema for each test:
 

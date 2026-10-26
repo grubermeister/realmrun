@@ -1,16 +1,19 @@
 /**
- * `realmrun` entry point: runs the fixture offline against `DATABASE_URL`
- * and prints the committed result. Nothing runs unless this is the main module.
+ * `realmrun` entry point: runs the accumulator fixture or the planet scenario
+ * offline against `DATABASE_URL` and prints the committed result. Nothing runs
+ * unless this is the main module.
  */
 
 import pg from "pg";
 import { parseCliArgs, USAGE, UsageError } from "./cli.ts";
-import { runFixture } from "./simulation.ts";
+import type { CliOptions } from "./cli.ts";
+import { renderPlanetMap } from "./planetary-map.ts";
+import { runFixture, runPlanet } from "./simulation.ts";
 
 export async function main(args: readonly string[]): Promise<number> {
-  let until;
+  let options: CliOptions;
   try {
-    ({ until } = parseCliArgs(args));
+    options = parseCliArgs(args);
   } catch (error) {
     if (!(error instanceof UsageError)) throw error;
     console.error(`realmrun: ${error.message}\n${USAGE}`);
@@ -28,7 +31,11 @@ export async function main(args: readonly string[]): Promise<number> {
   client.on("error", () => {});
   try {
     await client.connect();
-    const result = await runFixture(client, until);
+    if (options.planet !== undefined) {
+      console.log(renderPlanetMap(await runPlanet(client, options.until, options.planet)));
+      return 0;
+    }
+    const result = await runFixture(client, options.until);
     console.log(`Simulated time: ${result.now} ms`);
     console.log(`Accumulator: ${JSON.stringify(result.accumulator ?? null)}`);
     return 0;

@@ -6,6 +6,8 @@
       "name": "realmrun",
       "dependencies": {
         "lattice-accumulator-module": "file:./modules/accumulator",
+        "lattice-climate-module": "file:./modules/climate",
+        "lattice-terrain-module": "file:./modules/terrain",
         "pg": "^8.23.1",
         "realmlib": "file:../realmlib",
       },
@@ -67,6 +69,10 @@
 
     "lattice-accumulator-module": ["lattice-accumulator-module@file:modules/accumulator", { "dependencies": { "realmlib": "file:../../../realmlib" } }],
 
+    "lattice-climate-module": ["lattice-climate-module@file:modules/climate", { "dependencies": { "lattice-terrain-module": "file:../terrain", "realmlib": "file:../../../realmlib" } }],
+
+    "lattice-terrain-module": ["lattice-terrain-module@file:modules/terrain", { "dependencies": { "realmlib": "file:../../../realmlib" } }],
+
     "pg": ["pg@8.23.1", "", { "dependencies": { "pg-connection-string": "^2.14.1", "pg-pool": "^3.14.0", "pg-protocol": "^1.16.1", "pg-types": "2.2.0", "pgpass": "1.0.5" }, "optionalDependencies": { "pg-cloudflare": "^1.4.1" }, "peerDependencies": { "pg-native": ">=3.0.1" }, "optionalPeers": ["pg-native"] }, "sha512-aL96AHANtWjPLDOLqnhx+ngp9+UK7ETEU8VJrDCGvsSSi/mGLcWYsS6Herg7lmaBJe4uwrfqsa7gTEFaSizDoQ=="],
 
     "pg-cloudflare": ["pg-cloudflare@1.4.1", "", {}, "sha512-6PQbsFWZcp9EmJEwy5cGQ2La+AMWpP46lgbb8X+U/XsHIUweYDNCpeuKck5RxL2MdVFi7krbbEi5nX4Zh7JhrQ=="],
@@ -103,6 +109,12 @@
 
     "@types/node/undici-types": ["undici-types@8.9.0", "", {}, "sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg=="],
 
-    "lattice-accumulator-module/realmlib": ["realmlib@file:../realmlib", {}],
+    "lattice-accumulator-module/realmlib": ["realmlib@file:../realmlib", { "devDependencies": { "@types/bun": "1.4.3", "@types/pg": "^8.23.1", "pg": "^8.23.1", "typescript": "^7.0.2" } }],
+
+    "lattice-climate-module/lattice-terrain-module": ["lattice-terrain-module@file:modules/terrain", {}],
+
+    "lattice-climate-module/realmlib": ["realmlib@file:../realmlib", {}],
+
+    "lattice-terrain-module/realmlib": ["realmlib@file:../realmlib", {}],
   }
 }

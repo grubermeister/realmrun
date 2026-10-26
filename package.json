@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "lattice-accumulator-module": "file:./modules/accumulator",
+    "lattice-climate-module": "file:./modules/climate",
+    "lattice-terrain-module": "file:./modules/terrain",
     "pg": "^8.23.1",
     "realmlib": "file:../realmlib"
   },
